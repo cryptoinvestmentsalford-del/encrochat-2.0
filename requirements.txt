@@ -1,0 +1,36 @@
+# Platinum Secure Flasher - Python Dependencies
+# UK Operations Only
+
+# Core GUI Framework
+tkinter
+
+# Image Processing & QR Codes
+Pillow==10.0.1
+qrcode[pil]==7.4.2
+
+# Networking & API
+requests==2.31.0
+flask==2.3.3
+flask-cors==4.0.0
+
+# Security & Authentication
+werkzeug==2.3.7
+PyJWT==2.8.0
+cryptography==41.0.7
+
+# Database
+sqlite3
+
+# Android App Framework (Kivy)
+kivy==2.2.0
+kivymd==1.1.1
+
+# Additional Kivy dependencies
+docutils
+pygments
+pypiwin32; sys_platform == "win32"
+kivy_deps.sdl2; sys_platform == "win32"
+kivy_deps.glew; sys_platform == "win32"
+
+# Development & Utilities
+python-dateutil==2.8.2
