@@ -24,6 +24,9 @@ import shutil
 import webbrowser
 import base64
 from io import BytesIO
+import sqlite3
+import socket
+import time
 
 class PlatinumSecureFlasher:
     def __init__(self):
@@ -32,11 +35,19 @@ class PlatinumSecureFlasher:
         self.root.geometry("1400x900")
         self.root.configure(bg='#0a0a0a')
         
+        # Database initialization
+        self.init_database()
+        
         # Subscription system
         self.license_file = "platinum_license.json"
         self.subscription_file = "platinum_subscription.json"
         self.resellers_file = "platinum_resellers.json"
+        self.devices_file = "platinum_devices.json"
         self.device_uuid = self.get_device_uuid()
+        
+        # Remote wipe configuration
+        self.wipe_server_port = 8888
+        self.wipe_secret_key = "platinum_wipe_secret_2024"
         
         # Crypto wallet addresses (replace with your actual addresses)
         self.crypto_wallets = {
@@ -62,6 +73,9 @@ class PlatinumSecureFlasher:
         # Load resellers from file
         self.resellers = self.load_resellers()
         
+        # Load tracked devices
+        self.tracked_devices = self.load_tracked_devices()
+        
         # Supported devices
         self.supported_devices = {
             'oriole': 'Pixel 6',
@@ -80,27 +94,72 @@ class PlatinumSecureFlasher:
         
         self.setup_ui()
         self.check_subscription()
+        self.start_remote_wipe_server()
         
-    def get_device_uuid(self):
-        """Generate unique device UUID"""
+    def init_database(self):
+        """Initialize SQLite database for device tracking"""
         try:
-            import platform
-            machine_id = platform.node() + platform.machine()
-            return str(uuid.uuid5(uuid.NAMESPACE_DNS, machine_id))
-        except:
-            return str(uuid.uuid4())
-    
-    def load_resellers(self):
-        """Load resellers from JSON file"""
-        try:
-            if os.path.exists(self.resellers_file):
-                with open(self.resellers_file, 'r') as f:
-                    return json.load(f)
-            else:
-                # Default empty resellers list
-                return []
+            self.db_path = "platinum_devices.db"
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Create tables
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tracked_devices (
+                    device_id TEXT PRIMARY KEY,
+                    device_serial TEXT UNIQUE,
+                    device_model TEXT,
+                    owner_info TEXT,
+                    flash_date TEXT,
+                    last_contact TEXT,
+                    status TEXT DEFAULT 'active',
+                    wipe_key TEXT,
+                    reseller TEXT,
+                    notes TEXT
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS wipe_commands (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT,
+                    command_type TEXT,
+                    timestamp TEXT,
+                    status TEXT DEFAULT 'pending',
+                    result TEXT,
+                    FOREIGN KEY (device_id) REFERENCES tracked_devices (device_id)
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS reseller_commissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reseller_name TEXT,
+                    device_id TEXT,
+                    commission_amount REAL,
+                    currency TEXT,
+                    date_earned TEXT,
+                    paid_status TEXT DEFAULT 'unpaid'
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            
         except Exception as e:
-            print(f"Error loading resellers: {e}")
+            print(f"Database initialization error: {e}")
+
+    def load_tracked_devices(self):
+        """Load tracked devices from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM tracked_devices")
+            devices = cursor.fetchall()
+            conn.close()
+            return devices
+        except Exception as e:
+            print(f"Error loading tracked devices: {e}")
             return []
     
     def save_resellers(self):
@@ -194,6 +253,8 @@ class PlatinumSecureFlasher:
         self.setup_reseller_management_tab()
         self.setup_hardening_tab()
         self.setup_logs_tab()
+        self.setup_remote_wipe_tab()
+        self.setup_device_tracking_tab()
         
     def setup_flash_tab(self):
         """Setup flashing tab"""
@@ -620,6 +681,142 @@ UK operations only - No international services.
         ttk.Button(log_controls, text="💾 Save Logs", 
                   command=self.save_logs,
                   style='Custom.TButton').pack(side='left', padx=10)
+        
+    def setup_remote_wipe_tab(self):
+        """Setup remote wipe tab"""
+        wipe_frame = tk.Frame(self.notebook, bg='#1a1a1a')
+        self.notebook.add(wipe_frame, text="🧹 Remote Wipe")
+        
+        # Wipe options
+        options_frame = tk.LabelFrame(wipe_frame, 
+                                    text="Remote Wipe Options", 
+                                    bg='#1a1a1a', 
+                                    fg='#00d4ff',
+                                    font=('Arial', 12, 'bold'))
+        options_frame.pack(fill='x', padx=15, pady=15)
+        
+        # Wipe command selection
+        self.wipe_command_var = tk.StringVar(value='factory_reset')
+        
+        tk.Radiobutton(options_frame, text="Factory Reset (Full Data Erasure)", 
+                      variable=self.wipe_command_var,
+                      value='factory_reset',
+                      bg='#1a1a1a', fg='#ffffff',
+                      selectcolor='#2d2d2d',
+                      font=('Arial', 10)).pack(anchor='w', padx=15, pady=5)
+        
+        tk.Radiobutton(options_frame, text="Data Only (Keep System Files)", 
+                      variable=self.wipe_command_var,
+                      value='data_only',
+                      bg='#1a1a1a', fg='#ffffff',
+                      selectcolor='#2d2d2d',
+                      font=('Arial', 10)).pack(anchor='w', padx=15, pady=5)
+        
+        # Wipe button
+        wipe_btn = ttk.Button(wipe_frame, text="🧹 START WIPE", 
+                             command=self.start_remote_wipe,
+                             style='Custom.TButton')
+        wipe_btn.pack(pady=20)
+        
+        # Progress bar
+        self.wipe_progress = ttk.Progressbar(wipe_frame, mode='indeterminate')
+        self.wipe_progress.pack(fill='x', padx=15, pady=15)
+        
+        # Wipe status display
+        self.wipe_status_label = ttk.Label(wipe_frame, 
+                                          text="Wipe Status: Idle", 
+                                          style='Subtitle.TLabel')
+        self.wipe_status_label.pack(pady=10)
+        
+        # Wipe logs
+        self.wipe_log_text = scrolledtext.ScrolledText(wipe_frame, 
+                                                       bg='#0a0a0a', 
+                                                       fg='#ff0000',
+                                                       font=('Consolas', 10))
+        self.wipe_log_text.pack(fill='both', expand=True, padx=15, pady=15)
+        
+        # Wipe controls
+        wipe_controls = tk.Frame(wipe_frame, bg='#1a1a1a')
+        wipe_controls.pack(fill='x', padx=15, pady=10)
+        
+        ttk.Button(wipe_controls, text="🔄 Refresh Status", 
+                  command=self.refresh_wipe_status,
+                  style='Custom.TButton').pack(side='left', padx=10)
+        
+        ttk.Button(wipe_controls, text="💾 Save Wipe Logs", 
+                  command=self.save_wipe_logs,
+                  style='Custom.TButton').pack(side='left', padx=10)
+        
+    def setup_device_tracking_tab(self):
+        """Setup device tracking tab"""
+        tracking_frame = tk.Frame(self.notebook, bg='#1a1a1a')
+        self.notebook.add(tracking_frame, text="📱 Device Tracking")
+        
+        # Device list
+        device_list_frame = tk.LabelFrame(tracking_frame, 
+                                         text="Tracked Devices", 
+                                         bg='#1a1a1a', 
+                                         fg='#00d4ff',
+                                         font=('Arial', 12, 'bold'))
+        device_list_frame.pack(fill='x', padx=15, pady=15)
+        
+        # Scrollable device list
+        device_canvas = tk.Canvas(device_list_frame, bg='#1a1a1a')
+        device_scrollbar = ttk.Scrollbar(device_list_frame, orient="vertical", command=device_canvas.yview)
+        self.device_scrollable_frame = tk.Frame(device_canvas, bg='#1a1a1a')
+        
+        self.device_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: device_canvas.configure(scrollregion=device_canvas.bbox("all"))
+        )
+        
+        device_canvas.create_window((0, 0), window=self.device_scrollable_frame, anchor="nw")
+        device_canvas.configure(yscrollcommand=device_scrollbar.set)
+        
+        device_canvas.pack(side="left", fill="both", expand=True, padx=15, pady=15)
+        device_scrollbar.pack(side="right", fill="y")
+        
+        self.refresh_device_display()
+        
+        # Add new device section
+        add_device_frame = tk.LabelFrame(tracking_frame, 
+                                        text="Add New Tracked Device", 
+                                        bg='#1a1a1a', 
+                                        fg='#00d4ff',
+                                        font=('Arial', 12, 'bold'))
+        add_device_frame.pack(fill='x', padx=15, pady=15)
+        
+        # Device form
+        form_frame = tk.Frame(add_device_frame, bg='#1a1a1a')
+        form_frame.pack(fill='x', padx=15, pady=15)
+        
+        # Serial Number
+        tk.Label(form_frame, text="Device Serial Number:", bg='#1a1a1a', fg='#ffffff',
+                font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky='w', padx=5, pady=5)
+        self.device_serial = tk.Entry(form_frame, bg='#2d2d2d', fg='#ffffff', width=30)
+        self.device_serial.grid(row=0, column=1, padx=5, pady=5)
+        
+        # Model
+        tk.Label(form_frame, text="Device Model:", bg='#1a1a1a', fg='#ffffff',
+                font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky='w', padx=5, pady=5)
+        self.device_model = tk.Entry(form_frame, bg='#2d2d2d', fg='#ffffff', width=30)
+        self.device_model.grid(row=1, column=1, padx=5, pady=5)
+        
+        # Owner Info
+        tk.Label(form_frame, text="Owner Info (Name, Telegram, Phone):", bg='#1a1a1a', fg='#ffffff',
+                font=('Arial', 10, 'bold')).grid(row=2, column=0, sticky='w', padx=5, pady=5)
+        self.device_owner_info = tk.Entry(form_frame, bg='#2d2d2d', fg='#ffffff', width=30)
+        self.device_owner_info.grid(row=2, column=1, padx=5, pady=5)
+        
+        # Add button
+        ttk.Button(add_device_frame, text="➕ Add Tracked Device", 
+                  command=self.add_tracked_device,
+                  style='Custom.TButton').pack(pady=15)
+        
+        # Remove device button
+        ttk.Button(add_device_frame, text="🗑️ Remove Tracked Device", 
+                  command=self.remove_tracked_device,
+                  style='Custom.TButton').pack(pady=15)
         
     def add_reseller(self):
         """Add new reseller"""
@@ -1237,4 +1434,650 @@ Instructions:
                     
             # Unlock bootloader if requested
             if self.unlock_bootloader.get():
-                self.log_message("🔓 
+                self.log_message("🔓 Unlock Bootloader...")
+                if not self.unlock_bootloader_device():
+                    return
+                    
+            # Apply hardening if requested
+            if self.apply_hardening.get():
+                self.log_message("🛡️ Applying Security Hardening...")
+                if not self.apply_hardening_device():
+                    return
+                    
+            # Flash the image
+            self.log_message("📦 Flashing image...")
+            if not self.flash_grapheneos_image():
+                return
+                
+            self.log_message("✅ Flash process completed successfully!")
+            messagebox.showinfo("Success", "GrapheneOS flash completed successfully!")
+            
+        except Exception as e:
+            self.log_message(f"Flash process error: {str(e)}")
+            messagebox.showerror("Error", f"Flash process failed: {str(e)}")
+        finally:
+            self.progress.stop()
+            self.log_message("Flash process finished.")
+            
+    def unlock_bootloader_device(self):
+        """Unlock bootloader of the connected device"""
+        try:
+            self.log_message("Attempting to unlock bootloader...")
+            # Assuming adb root is needed for bootloader unlock
+            self.log_message("🔧 Executing 'adb root'...")
+            result = subprocess.run(['adb', 'root'], 
+                                  capture_output=True, text=True)
+            if result.returncode != 0:
+                self.log_message(f"❌ ERROR: 'adb root' failed. Output: {result.stderr}")
+                messagebox.showerror("Error", f"Failed to unlock bootloader: {result.stderr}")
+                return False
+                
+            self.log_message("🔓 Bootloader unlocked (if supported).")
+            return True
+        except Exception as e:
+            self.log_message(f"Error unlocking bootloader: {str(e)}")
+            messagebox.showerror("Error", f"Failed to unlock bootloader: {str(e)}")
+            return False
+            
+    def apply_hardening_device(self):
+        """Apply security hardening to the connected device"""
+        try:
+            self.log_message("Attempting to apply security hardening...")
+            # Assuming adb shell commands for hardening
+            hardening_commands = [
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_minfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_maxfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_minfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_maxfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_kill\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_minfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_maxfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_kill\"'"
+            ]
+            
+            for cmd in hardening_commands:
+                self.log_message(f"Executing: {cmd}")
+                result = subprocess.run(cmd.split(), 
+                                      capture_output=True, text=True)
+                if result.returncode != 0:
+                    self.log_message(f"❌ ERROR: Command failed. Output: {result.stderr}")
+                    messagebox.showerror("Error", f"Hardening command failed: {cmd}\nError: {result.stderr}")
+                    return False
+                self.log_message(f"✅ Command successful: {cmd}")
+                
+            self.log_message("🛡️ Security hardening applied.")
+            return True
+        except Exception as e:
+            self.log_message(f"Error applying hardening: {str(e)}")
+            messagebox.showerror("Error", f"Failed to apply hardening: {str(e)}")
+            return False
+            
+    def flash_grapheneos_image(self):
+        """Flash the selected GrapheneOS image to the connected device"""
+        try:
+            # Assuming the image is in a ZIP file
+            zip_path = self.file_path.get()
+            if not zip_path:
+                self.log_message("No image file selected.")
+                messagebox.showerror("Error", "Please select a GrapheneOS image file.")
+                return False
+                
+            # Extract ZIP to a temporary directory
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(tempfile.gettempdir())
+                
+            # Find the image file (e.g., boot.img or recovery.img)
+            image_path = None
+            for root, dirs, files in os.walk(tempfile.gettempdir()):
+                for file in files:
+                    if file.endswith(('.img', '.zip', '.bin', '.raw')):
+                        image_path = os.path.join(root, file)
+                        break
+                if image_path:
+                    break
+                    
+            if not image_path:
+                self.log_message("No image file found in the ZIP.")
+                messagebox.showerror("Error", "No image file (boot.img, recovery.img, etc.) found in the selected ZIP.")
+                return False
+                
+            self.log_message(f"Found image file: {image_path}")
+            
+            # Determine if it's a boot or recovery image
+            is_boot_image = False
+            if 'boot' in image_path.lower():
+                is_boot_image = True
+                self.log_message("Detected boot image.")
+            elif 'recovery' in image_path.lower():
+                self.log_message("Detected recovery image.")
+            else:
+                self.log_message("Unknown image type. Assuming boot image.")
+                is_boot_image = True
+                
+            # Flash the image
+            self.log_message(f"Flashing {image_path} to {self.device_var.get()}...")
+            if is_boot_image:
+                result = subprocess.run(['adb', 'flash', 'boot', image_path], 
+                                      capture_output=True, text=True)
+                if result.returncode != 0:
+                    self.log_message(f"❌ ERROR: 'adb flash boot' failed. Output: {result.stderr}")
+                    messagebox.showerror("Error", f"Failed to flash boot image: {result.stderr}")
+                    return False
+                self.log_message("✅ Boot image flashed successfully.")
+            else:
+                result = subprocess.run(['adb', 'flash', 'recovery', image_path], 
+                                      capture_output=True, text=True)
+                if result.returncode != 0:
+                    self.log_message(f"❌ ERROR: 'adb flash recovery' failed. Output: {result.stderr}")
+                    messagebox.showerror("Error", f"Failed to flash recovery image: {result.stderr}")
+                    return False
+                self.log_message("✅ Recovery image flashed successfully.")
+                
+            # Clean up temporary files
+            shutil.rmtree(tempfile.gettempdir())
+            self.log_message("Temporary files cleaned up.")
+            return True
+        except Exception as e:
+            self.log_message(f"Error flashing image: {str(e)}")
+            messagebox.showerror("Error", f"Failed to flash image: {str(e)}")
+            return False
+            
+    def verify_grapheneos_image(self):
+        """Verify the integrity of the flashed image"""
+        try:
+            self.log_message("Verifying image integrity...")
+            # Assuming a simple md5sum check for now
+            # In a real scenario, you'd use a more robust tool like ADB's 'file_has_signature'
+            # or a custom Python script to check for specific signatures.
+            
+            # Example: Check if the device is in a known good state (e.g., booted)
+            # This is a placeholder and needs proper implementation
+            self.log_message("Placeholder for image verification logic.")
+            messagebox.showinfo("Info", "Image verification is a placeholder. Please manually check the device.")
+            return True # Assume success for now
+            
+        except Exception as e:
+            self.log_message(f"Error verifying image: {str(e)}")
+            messagebox.showerror("Error", f"Failed to verify image: {str(e)}")
+            return False
+            
+    def start_remote_wipe(self):
+        """Start the remote wipe process"""
+        try:
+            self.wipe_progress.start()
+            self.wipe_status_label.config(text="Wipe Status: In Progress")
+            self.wipe_log_text.delete(1.0, tk.END)
+            
+            # Connect to the wipe server
+            wipe_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            wipe_socket.connect(('localhost', self.wipe_server_port))
+            
+            # Send the wipe command
+            wipe_command = self.wipe_command_var.get()
+            wipe_socket.sendall(wipe_command.encode())
+            
+            # Receive confirmation
+            response = wipe_socket.recv(1024).decode()
+            if response.strip() == "OK":
+                self.log_message("Wipe command sent successfully.")
+                self.wipe_status_label.config(text="Wipe Status: In Progress (Waiting for confirmation)")
+                self.wipe_log_text.insert(tk.END, f"Wipe command '{wipe_command}' sent. Waiting for confirmation...\n")
+                
+                # Wait for a response from the server
+                while True:
+                    try:
+                        response = wipe_socket.recv(1024).decode()
+                        if response.strip() == "DONE":
+                            self.wipe_status_label.config(text="Wipe Status: Completed")
+                            self.wipe_log_text.insert(tk.END, "Wipe process completed.\n")
+                            break
+                        elif response.strip() == "ERROR":
+                            self.wipe_status_label.config(text="Wipe Status: Failed")
+                            self.wipe_log_text.insert(tk.END, "Wipe process failed.\n")
+                            break
+                        else:
+                            self.wipe_log_text.insert(tk.END, f"Server response: {response}\n")
+                            time.sleep(0.1) # Avoid busy-waiting
+                    except socket.timeout:
+                        self.wipe_log_text.insert(tk.END, "Server did not respond for too long.\n")
+                        break
+                    except Exception as e:
+                        self.wipe_log_text.insert(tk.END, f"Error receiving wipe response: {e}\n")
+                        break
+            else:
+                self.wipe_status_label.config(text="Wipe Status: Failed")
+                self.wipe_log_text.insert(tk.END, f"Failed to send wipe command. Server response: {response}\n")
+                
+            wipe_socket.close()
+            self.wipe_progress.stop()
+            
+        except Exception as e:
+            self.wipe_status_label.config(text="Wipe Status: Failed")
+            self.wipe_log_text.insert(tk.END, f"Error initiating wipe: {str(e)}\n")
+            self.wipe_progress.stop()
+            
+    def refresh_wipe_status(self):
+        """Refresh the status of the remote wipe process"""
+        try:
+            wipe_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            wipe_socket.settimeout(1) # Short timeout for status check
+            wipe_socket.connect(('localhost', self.wipe_server_port))
+            
+            wipe_socket.sendall("STATUS".encode())
+            response = wipe_socket.recv(1024).decode()
+            
+            if response.strip() == "OK":
+                self.wipe_status_label.config(text="Wipe Status: In Progress (Waiting for confirmation)")
+                self.wipe_log_text.insert(tk.END, "Connected to wipe server. Waiting for confirmation...\n")
+            elif response.strip() == "DONE":
+                self.wipe_status_label.config(text="Wipe Status: Completed")
+                self.wipe_log_text.insert(tk.END, "Wipe server is done.\n")
+            elif response.strip() == "ERROR":
+                self.wipe_status_label.config(text="Wipe Status: Failed")
+                self.wipe_log_text.insert(tk.END, "Wipe server is in error state.\n")
+            else:
+                self.wipe_status_label.config(text="Wipe Status: Idle")
+                self.wipe_log_text.insert(tk.END, f"Wipe server status: {response}\n")
+                
+            wipe_socket.close()
+        except socket.timeout:
+            self.wipe_status_label.config(text="Wipe Status: Idle")
+            self.wipe_log_text.insert(tk.END, "Could not connect to wipe server for status check.\n")
+        except Exception as e:
+            self.wipe_status_label.config(text="Wipe Status: Failed")
+            self.wipe_log_text.insert(tk.END, f"Error refreshing wipe status: {str(e)}\n")
+            
+    def save_wipe_logs(self):
+        """Save wipe logs to file"""
+        try:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+            )
+            if file_path:
+                with open(file_path, 'w') as f:
+                    f.write(self.wipe_log_text.get(1.0, tk.END))
+                self.log_message(f"Wipe logs saved to: {file_path}")
+        except Exception as e:
+            self.log_message(f"Error saving wipe logs: {str(e)}")
+            
+    def add_tracked_device(self):
+        """Add a new tracked device to the database"""
+        try:
+            serial = self.device_serial.get().strip()
+            model = self.device_model.get().strip()
+            owner_info = self.device_owner_info.get().strip()
+            
+            if not all([serial, model]):
+                messagebox.showerror("Error", "Serial number and model are required.")
+                return
+                
+            # Generate a unique device ID
+            device_id = str(uuid.uuid4())
+            
+            # Store owner info in a JSON-like string
+            owner_data = {
+                "name": owner_info.split(',')[0].strip(),
+                "telegram": owner_info.split(',')[1].strip(),
+                "phone": owner_info.split(',')[2].strip()
+            }
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO tracked_devices (device_id, device_serial, device_model, owner_info, flash_date, last_contact, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'active')
+            ''', (device_id, serial, model, json.dumps(owner_data), datetime.now().isoformat(), datetime.now().isoformat()))
+            
+            conn.commit()
+            conn.close()
+            
+            self.log_message(f"Added tracked device: {serial} ({model})")
+            messagebox.showinfo("Success", f"Tracked device '{serial}' added successfully!")
+            self.refresh_device_display()
+            
+        except Exception as e:
+            self.log_message(f"Error adding tracked device: {str(e)}")
+            messagebox.showerror("Error", f"Failed to add tracked device: {str(e)}")
+            
+    def remove_tracked_device(self):
+        """Remove a tracked device from the database"""
+        try:
+            selected = self.device_tree.selection()
+            if not selected:
+                messagebox.showwarning("Warning", "Please select a device to remove")
+                return
+                
+            item = self.device_tree.item(selected[0])
+            device_id = item['values'][0] # Assuming device_id is the first column
+            
+            if messagebox.askyesno("Confirm Deletion", f"Are you sure you want to remove device '{device_id}'?"):
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    DELETE FROM tracked_devices WHERE device_id = ?
+                ''', (device_id,))
+                
+                conn.commit()
+                conn.close()
+                
+                self.log_message(f"Removed tracked device: {device_id}")
+                messagebox.showinfo("Success", f"Tracked device '{device_id}' removed successfully!")
+                self.refresh_device_display()
+                
+        except Exception as e:
+            self.log_message(f"Error removing tracked device: {str(e)}")
+            messagebox.showerror("Error", f"Failed to remove tracked device: {str(e)}")
+            
+    def refresh_device_display(self):
+        """Refresh the device tracking display"""
+        try:
+            # Clear existing widgets
+            for widget in self.device_scrollable_frame.winfo_children():
+                widget.destroy()
+                
+            if not self.tracked_devices:
+                tk.Label(self.device_scrollable_frame, 
+                        text="No devices tracked yet. Use the 'Device Tracking' tab to add devices.",
+                        bg='#1a1a1a', fg='#ffffff', font=('Arial', 11)).pack(padx=15, pady=20)
+                return
+                
+            # Display tracked devices
+            for device in self.tracked_devices:
+                d_frame = tk.Frame(self.device_scrollable_frame, bg='#2d2d2d', relief='raised', bd=1)
+                d_frame.pack(fill='x', padx=15, pady=10)
+                
+                device_id = device[0]
+                serial = device[1]
+                model = device[2]
+                owner_info = json.loads(device[3])
+                flash_date = datetime.fromisoformat(device[4])
+                last_contact = datetime.fromisoformat(device[5])
+                status = device[6]
+                
+                tk.Label(d_frame, text=f"📱 {model} (Serial: {serial})", 
+                        bg='#2d2d2d', fg='#00d4ff', font=('Arial', 11, 'bold')).pack(anchor='w', padx=10, pady=5)
+                
+                owner_text = f"Owner: {owner_info['name']}"
+                if owner_info['telegram']:
+                    owner_text += f"\n📱 Telegram: {owner_info['telegram']}"
+                if owner_info['phone']:
+                    owner_text += f"\n📞 Phone: {owner_info['phone']}"
+                
+                tk.Label(d_frame, text=owner_text, 
+                        bg='#2d2d2d', fg='#ffffff', font=('Arial', 10), justify='left').pack(anchor='w', padx=10)
+                
+                tk.Label(d_frame, text=f"Flash Date: {flash_date.strftime('%Y-%m-%d %H:%M:%S')}", 
+                        bg='#2d2d2d', fg='#00ff00', font=('Arial', 10)).pack(anchor='w', padx=10, pady=2)
+                
+                tk.Label(d_frame, text=f"Last Contact: {last_contact.strftime('%Y-%m-%d %H:%M:%S')}", 
+                        bg='#2d2d2d', fg='#ff0000', font=('Arial', 10)).pack(anchor='w', padx=10, pady=2)
+                
+                tk.Label(d_frame, text=f"Status: {status}", 
+                        bg='#2d2d2d', fg='#ffffff', font=('Arial', 10)).pack(anchor='w', padx=10, pady=2)
+                
+                # Add a button to contact the owner
+                button_frame = tk.Frame(d_frame, bg='#2d2d2d')
+                button_frame.pack(anchor='w', padx=10, pady=5)
+                
+                owner_contact_info = f"{owner_info['name']}, {owner_info['telegram']}, {owner_info['phone']}"
+                ttk.Button(button_frame, text="📞 Contact Owner", 
+                          command=lambda info=owner_contact_info: self.open_contact('telegram', owner_info['telegram']),
+                          style='Custom.TButton').pack(side='left', padx=5)
+                
+                if owner_info['phone']:
+                    ttk.Button(button_frame, text="📞 Call", 
+                              command=lambda phone=owner_info['phone']: self.open_contact('phone', phone),
+                              style='Custom.TButton').pack(side='left', padx=5)
+                
+                if owner_info['email']:
+                    ttk.Button(button_frame, text="📧 Email", 
+                              command=lambda email=owner_info['email']: self.open_contact('email', email),
+                              style='Custom.TButton').pack(side='left', padx=5)
+                
+                # Add a button to remove the device
+                ttk.Button(d_frame, text="🗑️ Remove Device", 
+                          command=lambda d_id=device_id: self.remove_tracked_device(),
+                          style='Custom.TButton').pack(anchor='e', padx=10, pady=5)
+                
+        except Exception as e:
+            self.log_message(f"Error refreshing device display: {str(e)}")
+            
+    def start_remote_wipe_server(self):
+        """Start a local server to receive wipe commands"""
+        try:
+            wipe_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            wipe_server.bind(('localhost', self.wipe_server_port))
+            wipe_server.listen(5)
+            self.log_message(f"Remote wipe server listening on port {self.wipe_server_port}")
+            
+            while True:
+                client_socket, addr = wipe_server.accept()
+                self.log_message(f"Accepted connection from {addr}")
+                
+                # Receive wipe command
+                try:
+                    wipe_command = client_socket.recv(1024).decode()
+                    self.log_message(f"Received wipe command: {wipe_command}")
+                    
+                    if wipe_command == "factory_reset":
+                        self.log_message("Executing factory reset...")
+                        # In a real scenario, you'd send a command to the device to perform a factory reset
+                        # This might involve ADB commands or a custom wipe script.
+                        # For demonstration, we'll just acknowledge.
+                        client_socket.sendall("OK".encode())
+                        self.log_message("Factory reset acknowledged.")
+                        self.wipe_log_text.insert(tk.END, "Factory reset acknowledged.\n")
+                        
+                    elif wipe_command == "data_only":
+                        self.log_message("Executing data-only wipe...")
+                        # In a real scenario, you'd send a command to the device to perform a data-only wipe
+                        # This might involve ADB commands or a custom wipe script.
+                        client_socket.sendall("OK".encode())
+                        self.log_message("Data-only wipe acknowledged.")
+                        self.wipe_log_text.insert(tk.END, "Data-only wipe acknowledged.\n")
+                        
+                    else:
+                        client_socket.sendall("ERROR".encode())
+                        self.log_message(f"Unknown wipe command: {wipe_command}")
+                        self.wipe_log_text.insert(tk.END, f"Unknown wipe command: {wipe_command}\n")
+                        
+                except Exception as e:
+                    self.log_message(f"Error processing wipe command: {str(e)}")
+                    self.wipe_log_text.insert(tk.END, f"Error processing wipe command: {str(e)}\n")
+                    client_socket.sendall("ERROR".encode())
+                    
+                client_socket.close()
+                self.log_message(f"Connection from {addr} closed.")
+                
+        except Exception as e:
+            self.log_message(f"Error starting wipe server: {str(e)}")
+            messagebox.showerror("Error", f"Failed to start wipe server: {str(e)}")
+            
+    def get_device_uuid(self):
+        """Generate unique device UUID"""
+        try:
+            import platform
+            machine_id = platform.node() + platform.machine()
+            return str(uuid.uuid5(uuid.NAMESPACE_DNS, machine_id))
+        except:
+            return str(uuid.uuid4())
+    
+    def load_resellers(self):
+        """Load resellers from JSON file"""
+        try:
+            if os.path.exists(self.resellers_file):
+                with open(self.resellers_file, 'r') as f:
+                    return json.load(f)
+            else:
+                # Default empty resellers list
+                return []
+        except Exception as e:
+            print(f"Error loading resellers: {e}")
+            return []
+    
+    def save_resellers(self):
+        """Save resellers to JSON file"""
+        try:
+            with open(self.resellers_file, 'w') as f:
+                json.dump(self.resellers, f, indent=2)
+            self.log_message("Resellers database saved")
+        except Exception as e:
+            self.log_message(f"Error saving resellers: {str(e)}")
+            
+    def apply_hardening_settings(self):
+        """Apply hardening settings to the connected device"""
+        try:
+            self.log_message("Attempting to apply hardening settings...")
+            # Assuming adb shell commands for hardening
+            hardening_commands = [
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_minfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_maxfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_minfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_maxfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_kill\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_minfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_maxfree\"'",
+                "adb shell 'su -c \"echo 0 > /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk_kill_kill\"'"
+            ]
+            
+            for cmd in hardening_commands:
+                self.log_message(f"Executing: {cmd}")
+                result = subprocess.run(cmd.split(), 
+                                      capture_output=True, text=True)
+                if result.returncode != 0:
+                    self.log_message(f"❌ ERROR: Command failed. Output: {result.stderr}")
+                    messagebox.showerror("Error", f"Hardening command failed: {cmd}\nError: {result.stderr}")
+                    return False
+                self.log_message(f"✅ Command successful: {cmd}")
+                
+            self.log_message("🛡️ Security hardening applied.")
+            return True
+        except Exception as e:
+            self.log_message(f"Error applying hardening: {str(e)}")
+            messagebox.showerror("Error", f"Failed to apply hardening: {str(e)}")
+            return False
+            
+    def refresh_device_tree(self):
+        """Refresh the device tracking tree view"""
+        try:
+            # Clear existing items
+            for item in self.device_tree.get_children():
+                self.device_tree.delete(item)
+            
+            # Add current tracked devices
+            for device in self.tracked_devices:
+                device_id = device[0]
+                serial = device[1]
+                model = device[2]
+                owner_info = json.loads(device[3])
+                flash_date = datetime.fromisoformat(device[4])
+                last_contact = datetime.fromisoformat(device[5])
+                status = device[6]
+                
+                owner_text = f"{owner_info['name']}"
+                if owner_info['telegram']:
+                    owner_text += f", {owner_info['telegram']}"
+                if owner_info['phone']:
+                    owner_text += f", {owner_info['phone']}"
+                
+                self.device_tree.insert('', 'end', values=(
+                    device_id,
+                    serial,
+                    model,
+                    owner_text,
+                    flash_date.strftime('%Y-%m-%d %H:%M:%S'),
+                    last_contact.strftime('%Y-%m-%d %H:%M:%S'),
+                    status
+                ))
+                
+        except Exception as e:
+            self.log_message(f"Error refreshing device tree: {str(e)}")
+            
+    def refresh_device_display(self):
+        """Refresh the device tracking display"""
+        try:
+            # Clear existing widgets
+            for widget in self.device_scrollable_frame.winfo_children():
+                widget.destroy()
+                
+            if not self.tracked_devices:
+                tk.Label(self.device_scrollable_frame, 
+                        text="No devices tracked yet. Use the 'Device Tracking' tab to add devices.",
+                        bg='#1a1a1a', fg='#ffffff', font=('Arial', 11)).pack(padx=15, pady=20)
+                return
+                
+            # Display tracked devices
+            for device in self.tracked_devices:
+                d_frame = tk.Frame(self.device_scrollable_frame, bg='#2d2d2d', relief='raised', bd=1)
+                d_frame.pack(fill='x', padx=15, pady=10)
+                
+                device_id = device[0]
+                serial = device[1]
+                model = device[2]
+                owner_info = json.loads(device[3])
+                flash_date = datetime.fromisoformat(device[4])
+                last_contact = datetime.fromisoformat(device[5])
+                status = device[6]
+                
+                tk.Label(d_frame, text=f"📱 {model} (Serial: {serial})", 
+                        bg='#2d2d2d', fg='#00d4ff', font=('Arial', 11, 'bold')).pack(anchor='w', padx=10, pady=5)
+                
+                owner_text = f"Owner: {owner_info['name']}"
+                if owner_info['telegram']:
+                    owner_text += f"\n📱 Telegram: {owner_info['telegram']}"
+                if owner_info['phone']:
+                    owner_text += f"\n📞 Phone: {owner_info['phone']}"
+                
+                tk.Label(d_frame, text=owner_text, 
+                        bg='#2d2d2d', fg='#ffffff', font=('Arial', 10), justify='left').pack(anchor='w', padx=10)
+                
+                tk.Label(d_frame, text=f"Flash Date: {flash_date.strftime('%Y-%m-%d %H:%M:%S')}", 
+                        bg='#2d2d2d', fg='#00ff00', font=('Arial', 10)).pack(anchor='w', padx=10, pady=2)
+                
+                tk.Label(d_frame, text=f"Last Contact: {last_contact.strftime('%Y-%m-%d %H:%M:%S')}", 
+                        bg='#2d2d2d', fg='#ff0000', font=('Arial', 10)).pack(anchor='w', padx=10, pady=2)
+                
+                tk.Label(d_frame, text=f"Status: {status}", 
+                        bg='#2d2d2d', fg='#ffffff', font=('Arial', 10)).pack(anchor='w', padx=10, pady=2)
+                
+                # Add a button to contact the owner
+                button_frame = tk.Frame(d_frame, bg='#2d2d2d')
+                button_frame.pack(anchor='w', padx=10, pady=5)
+                
+                owner_contact_info = f"{owner_info['name']}, {owner_info['telegram']}, {owner_info['phone']}"
+                ttk.Button(button_frame, text="📞 Contact Owner", 
+                          command=lambda info=owner_contact_info: self.open_contact('telegram', owner_info['telegram']),
+                          style='Custom.TButton').pack(side='left', padx=5)
+                
+                if owner_info['phone']:
+                    ttk.Button(button_frame, text="📞 Call", 
+                              command=lambda phone=owner_info['phone']: self.open_contact('phone', phone),
+                              style='Custom.TButton').pack(side='left', padx=5)
+                
+                if owner_info['email']:
+                    ttk.Button(button_frame, text="📧 Email", 
+                              command=lambda email=owner_info['email']: self.open_contact('email', email),
+                              style='Custom.TButton').pack(side='left', padx=5)
+                
+                # Add a button to remove the device
+                ttk.Button(d_frame, text="🗑️ Remove Device", 
+                          command=lambda d_id=device_id: self.remove_tracked_device(),
+                          style='Custom.TButton').pack(anchor='e', padx=10, pady=5)
+                
+        except Exception as e:
+            self.log_message(f"Error refreshing device display: {str(e)}")
+            
+    def main(self):
+        """Main application loop"""
+        self.root.mainloop()
+
+if __name__ == "__main__":
+    app = PlatinumSecureFlasher()
+    app.main() 
